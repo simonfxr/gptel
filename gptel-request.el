@@ -1308,6 +1308,7 @@ a tool, use `gptel-make-tool', which see."
                           (:constructor gptel--make-tool-internal
                                         (&key function name description args
                                               async category confirm include
+                                              server-side-tool
                                               &allow-other-keys))
                           (:copier gptel--copy-tool))
   "Struct to specify tools for LLMs to run.
@@ -1324,7 +1325,8 @@ feed the LLM the results.  You can add tools via
   (async nil :type boolean :documentation "Whether the function runs asynchronously")
   (category nil :type string :documentation "Use to group tools by purpose")
   (confirm nil :type boolean :documentation "Seek confirmation before running tool?")
-  (include nil :type boolean :documentation "Include tool results in buffer?"))
+  (include nil :type boolean :documentation "Include tool results in buffer?")
+  (server-side-tool nil :type boolean :documentation "Whether the tool runs remotely on the LLM provider"))
 
 (defun gptel--preprocess-tool-args (spec)
   "Convert symbol :type values in tool SPEC to strings destructively."
@@ -1453,6 +1455,11 @@ the LLM output.  This is useful for logging and as context for
 subsequent requests in the same buffer.  This is primarily useful
 in chat buffers.
 
+SERVER-SIDE-TOOL: Whether this tool runs on the provider's
+infrastructure rather than inside Emacs.  Server-side tools are
+handled by backends that support them and are not dispatched
+locally.
+
 Here is an example definition:
 
   (gptel-make-tool
@@ -1487,6 +1494,23 @@ callback as its first argument, which it runs with the result:
            nil nil #'equal)
           tool)))
 
+;;; Built-in server-side tools
+(gptel-make-tool
+ :function (lambda () "Server-side web search functionality")
+ :name "serverside-search"
+ :description "Search the web for current information and recent events"
+ :args nil
+ :category "server-side"
+ :server-side-tool t)
+
+(gptel-make-tool
+ :function (lambda () "Server-side code execution functionality")
+ :name "serverside-code-execution"
+ :description "Execute Python code in a secure sandboxed environment"
+ :args nil
+ :category "server-side"
+ :server-side-tool t)
+
 (cl-defgeneric gptel--parse-tools (_backend tools)
   "Parse TOOLS and return a list of prompts.
 
@@ -1494,9 +1518,11 @@ TOOLS is a list of `gptel-tool' structs, which see.
 
 _BACKEND is the LLM backend in use.  This is the default
 implementation, used by OpenAI-compatible APIs and Ollama."
-  (vconcat
-   (mapcar
-    (lambda (tool)
+  (let ((local-tools (cl-remove-if #'gptel-tool-server-side-tool
+                                   (ensure-list tools))))
+    (vconcat
+     (mapcar
+      (lambda (tool)
       (list
        :type "function"
        :function
@@ -1537,7 +1563,7 @@ implementation, used by OpenAI-compatible APIs and Ollama."
                                (gptel-tool-args tool))))
                    :additionalProperties :json-false))
           (list :parameters (list :type "object" :properties nil))))))
-    (ensure-list tools))))
+      local-tools))))
 
 (cl-defgeneric gptel--parse-tool-results (backend results)
   "Return a BACKEND appropriate prompt containing tool call RESULTS.
@@ -2086,8 +2112,10 @@ Initiate the request when done."
         (plist-put info :model gptel-model)
         (when gptel-include-reasoning   ;Required for next-request-only scope
           (plist-put info :include-reasoning gptel-include-reasoning))
-        (when (and gptel-use-tools gptel-tools)
-          (plist-put info :tools gptel-tools))
+        (when-let* ((_ gptel-use-tools)
+                    (local-tools (cl-remove-if #'gptel-tool-server-side-tool
+                                               gptel-tools)))
+          (plist-put info :tools local-tools))
         (plist-put info :data
                    (gptel--request-data gptel-backend full-prompt)))
       (kill-buffer (current-buffer)))

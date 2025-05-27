@@ -96,23 +96,65 @@ information if the stream contains it.  Not my best work, I know."
                                        (cons (list :id (plist-get cblock :id)
                                                    :name (plist-get cblock :name))
                                              (plist-get info :tool-use))))
+                ("server_tool_use"
+                 (let ((tool-name (plist-get cblock :name)))
+                   (plist-put info :server-tool-use
+                              (cons (list :id (plist-get cblock :id)
+                                          :name tool-name)
+                                    (plist-get info :server-tool-use)))
+                   ;; Store tool type for later processing
+                   (plist-put info :current-server-tool tool-name)))
+                ("web_search_tool_result"
+                 (when-let* ((results (plist-get cblock :content)))
+                   (cl-loop for result across results
+                            when (equal (plist-get result :type) "web_search_result")
+                            do (push (format "- [%s](%s)\n"
+                                             (plist-get result :title)
+                                             (plist-get result :url))
+                                     content-strs))))
+                ("code_execution_tool_result"
+                 (when-let* ((content (plist-get cblock :content)))
+                   (push "\n━━━ Code Output ━━━\n```\n" content-strs)
+                   (when-let* ((stdout (plist-get content :stdout)))
+                     (push stdout content-strs))
+                   (when-let* ((stderr (plist-get content :stderr)))
+                     (push (format "\nError: %s" stderr) content-strs))
+                   (push "\n```\n━━━━━━━━━━━━━━━━━━\n" content-strs)))
                 ("thinking" (plist-put info :reasoning (plist-get cblock :thinking))
                  (plist-put info :reasoning-block 'in)))))
 
            ((looking-at "content_block_stop")
             (cond
              ((plist-get info :partial_json)   ;End of tool block
-              (condition-case-unless-debug nil ;Combine partial tool inputs
-                  (let* ((args-json (apply #'concat (nreverse (plist-get info :partial_json))))
-                         (args-decoded  ;Handle blank argument strings
-                          (if (string-empty-p args-json)
-                              nil (gptel--json-read-string args-json))))
-                    ;; Add the input to the tool-call spec
-                    (plist-put (car (plist-get info :tool-use)) :input args-decoded))
-                ;; If there was an error in reading that tool, we ignore it:
-                ;; TODO(tool) handle this error better
-                (error (pop (plist-get info :tool-use)))) ;TODO: nreverse :tool-use list
-              (plist-put info :partial_json nil))
+              (let* ((args-json (apply #'concat (nreverse (plist-get info :partial_json))))
+                     (current-tool (plist-get info :current-server-tool)))
+                (if current-tool
+                    ;; Handle server tools (web search, code execution)
+                    (condition-case nil
+                        (let ((input-data (gptel--json-read-string args-json)))
+                          (pcase current-tool
+                            ("web_search"
+                             (push (format "\n━━━ Searching Web ━━━\nQuery: %s\n"
+                                           (plist-get input-data :query))
+                                   content-strs))
+                            ("code_execution"
+                             (push (format "\n━━━ Executing Code ━━━\n```python\n%s\n```\n"
+                                           (plist-get input-data :code))
+                                   content-strs))))
+                      (error nil))
+                  ;; Handle regular tools
+                  (condition-case-unless-debug nil
+                      (let ((args-decoded  ;Handle blank argument strings
+                             (if (string-empty-p args-json)
+                                 nil (gptel--json-read-string args-json))))
+                        ;; Add the input to the tool-call spec
+                        (plist-put (car (plist-get info :tool-use)) :input args-decoded))
+                    ;; If there was an error in reading that tool, we ignore it:
+                    ;; TODO(tool) handle this error better
+                    (error (pop (plist-get info :tool-use)))))) ;TODO: nreverse :tool-use list
+              (plist-put info :partial_json nil)
+              (plist-put info :current-server-tool nil))
+
 
              ((eq (plist-get info :reasoning-block) 'in) ;End of reasoning block
               (plist-put info :reasoning-block t)))) ;Signal end of reasoning stream to filter
@@ -131,14 +173,14 @@ information if the stream contains it.  Not my best work, I know."
                   `((:role "assistant"
                      :content ,(vconcat ;Insert any LLM text and thinking text
                                 (and-let* ((reasoning (plist-get info :partial_reasoning)))
-                                 `((:type "thinking" :thinking ,reasoning
-                                    :signature ,(plist-get info :signature))))
+                                  `((:type "thinking" :thinking ,reasoning
+                                     :signature ,(plist-get info :signature))))
                                 (and-let* ((strs (plist-get info :partial_text)))
-                                 `((:type "text" :text ,(apply #'concat (nreverse strs)))))
+                                  `((:type "text" :text ,(apply #'concat (nreverse strs)))))
                                 (mapcar (lambda (tool-call) ;followed by the tool calls
                                           (append (list :type "tool_use")
-                                           (copy-sequence tool-call)))
-                                 tool-use))))))
+                                                  (copy-sequence tool-call)))
+                                        tool-use))))))
                 (plist-put info :partial_text nil) ; Clear any captured text
                 ;; Then shape the tool-use block by adding args so we can call the functions
                 (mapc (lambda (tool-call)
@@ -177,6 +219,30 @@ Mutate state INFO with response metadata."
    collect (plist-get cblock :text) into content-strs
    else if (equal type "tool_use")
    collect cblock into tool-use
+   else if (equal type "server_tool_use")
+   ;; Handle server tools (web search, code execution)
+   collect (format "\n━━━ Using %s ━━━\n"
+                   (if (equal (plist-get cblock :name) "code_execution")
+                       "Code Execution"
+                     (capitalize (plist-get cblock :name)))) into content-strs
+   else if (equal type "web_search_tool_result")
+   collect (let ((results-str "\n━━━ Search Results ━━━\n"))
+             (cl-loop for result across (plist-get cblock :content)
+                      when (equal (plist-get result :type) "web_search_result")
+                      do (setq results-str
+                               (concat results-str
+                                       (format "- [%s](%s)\n"
+                                               (plist-get result :title)
+                                               (plist-get result :url)))))
+             (concat results-str "━━━━━━━━━━━━━━━━━━━\n")) into content-strs
+   else if (equal type "code_execution_tool_result")
+   collect (let* ((result (plist-get cblock :content))
+                  (stdout (plist-get result :stdout))
+                  (stderr (plist-get result :stderr)))
+             (concat "\n━━━ Code Output ━━━\n```\n"
+                     (or stdout "")
+                     (if stderr (format "\nError: %s" stderr) "")
+                     "\n```\n━━━━━━━━━━━━━━━━━━\n")) into content-strs
    else if (equal type "thinking")
    do
    (plist-put
@@ -225,7 +291,7 @@ Mutate state INFO with response metadata."
                                               '(:type "ephemeral")))))
                           gptel--system-message)))
         (cachep `[(:type "text" :text ,gptel--system-message
-                         :cache_control (:type "ephemeral"))])
+                   :cache_control (:type "ephemeral"))])
         (t gptel--system-message))))
     (when gptel-temperature
       (plist-put prompts-plist :temperature gptel-temperature))
@@ -233,12 +299,28 @@ Mutate state INFO with response metadata."
       (when (eq gptel-use-tools 'force)
         (plist-put prompts-plist :tool_choice '(:type "any")))
       (when gptel-tools
-        (let ((tools-array (gptel--parse-tools backend gptel-tools)))
-          (plist-put prompts-plist :tools tools-array)
-          (when (and (or (eq gptel-cache t) (memq 'tool gptel-cache))
-                     (gptel--model-capable-p 'cache))
-            (nconc (aref tools-array (1- (length tools-array)))
-                   '(:cache_control (:type "ephemeral")))))))
+        (let ((regular-tools)
+              (server-tools))
+          ;; Separate regular tools from server-side tools
+          (dolist (tool gptel-tools)
+            (if (gptel-tool-server-side-tool tool)
+                (cond
+                 ((equal (gptel-tool-name tool) "serverside-search")
+                  (push '(:type "web_search_20250305" :name "web_search") server-tools))
+                 ((equal (gptel-tool-name tool) "serverside-code-execution")
+                  (push '(:type "code_execution_20250522" :name "code_execution") server-tools)))
+              (push tool regular-tools)))
+          ;; Parse regular tools and combine with server tools
+          (let ((tools-to-send server-tools))
+            (when regular-tools
+              (let ((tools-array (gptel--parse-tools backend regular-tools)))
+                (setq tools-to-send (append (vconcat tools-array) tools-to-send))
+                (when (and (or (eq gptel-cache t) (memq 'tool gptel-cache))
+                           (gptel--model-capable-p 'cache))
+                  (nconc (aref tools-array (1- (length tools-array)))
+                         '(:cache_control (:type "ephemeral"))))))
+            (when tools-to-send
+              (plist-put prompts-plist :tools (vconcat tools-to-send)))))))
     (when gptel--schema
       (plist-put prompts-plist :tools
                  (vconcat
@@ -293,7 +375,7 @@ TOOLS is a list of `gptel-tool' structs, which see."
                   (vconcat
                    (delq nil (mapcar
                               (lambda (arg) (and (not (plist-get arg :optional))
-                                            (plist-get arg :name)))
+                                                 (plist-get arg :name)))
                               (gptel-tool-args tool)))))))
     (ensure-list tools))))
 
@@ -357,8 +439,8 @@ TOOL-USE is a list of plists containing tool names, arguments and call results."
                       (plist-put call :id (gptel--anthropic-format-tool-id nil)))
                     (push (list :role "assistant"
                                 :content `[( :type "tool_use" :id ,(plist-get call :id)
-                                             :name ,(plist-get call :name)
-                                             :input ,(plist-get call :args))])
+                                                   :name ,(plist-get call :name)
+                                                   :input ,(plist-get call :args))])
                           prompts)
                     (push (gptel--parse-tool-results backend (list (cdr entry))) prompts))))
                (nreverse prompts))
@@ -410,7 +492,7 @@ TOOL-USE is a list of plists containing tool names, arguments and call results."
                              prompts)
                        (push (list :role "assistant"
                                    :content `[( :type "tool_use" :id ,id :name ,name
-                                                :input ,arguments)])
+                                                      :input ,arguments)])
                              prompts))
                    ((end-of-file invalid-read-syntax)
                     (message (format "Could not parse tool-call %s on line %s"
@@ -638,9 +720,10 @@ URL `https://docs.anthropic.com/en/docs/about-claude/models#model-comparison-tab
     (name &key curl-args stream key request-params
           (header
            (lambda () (when-let* ((key (gptel--get-api-key)))
-                   `(("x-api-key" . ,key)
-                     ("anthropic-version" . "2023-06-01")
-                     ("anthropic-beta" . "extended-cache-ttl-2025-04-11")))))
+                        `(("x-api-key" . ,key)
+                          ("anthropic-version" . "2023-06-01")
+                          ("anthropic-beta" . "extended-cache-ttl-2025-04-11")
+                          ("anthropic-beta" . "code-execution-2025-05-22")))))
           (models gptel--anthropic-models)
           (host "api.anthropic.com")
           (protocol "https")
@@ -711,7 +794,7 @@ for."
     (prog1 backend
       (setf (alist-get name gptel--known-backends
                        nil nil #'equal)
-                  backend))))
+            backend))))
 
 (provide 'gptel-anthropic)
 ;;; gptel-anthropic.el ends here
