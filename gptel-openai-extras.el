@@ -374,7 +374,14 @@ For the meanings of the keyword arguments, see `gptel-make-openai'."
           (host "api.x.ai")
           (protocol "https")
           (endpoint "/v1/chat/completions")
-          (models '((grok-3-latest
+          (models '((grok-4-latest
+                     :description "Grok 4"
+                     :capabilities '(tool-use json)
+                     :context-window 131072
+                     :input-cost 3
+                     :output-cost 15)
+
+                    (grok-3-latest
                      :description "Grok 3"
                      :capabilities '(tool-use json)
                      :context-window 131072
