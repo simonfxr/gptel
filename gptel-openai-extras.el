@@ -335,6 +335,65 @@ For the meanings of the keyword arguments, see `gptel-make-openai'."
     backend))
 
 ;;; xAI
+(cl-defstruct (gptel-xai (:include gptel-deepseek)
+                              (:copier nil)
+                              (:constructor gptel--make-xai)))
+
+(defsubst gptel--xai-parse-citations (citations)
+  (let ((counter 0))
+    (concat "\n\nCitations:\n"
+            (mapconcat (lambda (url)
+                         (setq counter (1+ counter))
+                         (format "[%d] %s" counter url))
+                       citations "\n"))))
+
+(cl-defmethod gptel--parse-response ((_backend gptel-xai) response _info)
+  "Parse xAI response RESPONSE."
+  (let ((response-string (map-nested-elt response '(:choices 0 :message :content)))
+        (citations-string (when-let* ((citations (map-elt response :citations)))
+                            (gptel--xai-parse-citations citations))))
+    (concat response-string citations-string)))
+
+(cl-defmethod gptel-curl--parse-stream ((_backend gptel-xai) info)
+  "Parse a xAI API data stream with INFO.
+
+If available, collect citations at the end and include them with
+the response."
+  (let ((resp (cl-call-next-method)))
+    (unless (plist-get info :citations)
+      (save-excursion
+        ;; Look for citations in the streaming data chunks
+        (goto-char (point-min))
+        ;; Skip past HTTP headers by finding the empty line
+        (when (re-search-forward "\r?\n\r?\n" nil t)
+          (let (found)
+            ;; Search through all data chunks for citations
+            (while (and (not found)
+                        (re-search-forward "^data: *{" nil t))
+              (goto-char (match-beginning 0))
+              (forward-char 6) ; Skip "data: "
+              (condition-case nil
+                  (let ((chunk (gptel--json-read)))
+                    (when-let* ((citations (map-elt chunk :citations)))
+                      (setq found t)
+                      (plist-put info :citations t)
+                      (setq resp (concat resp (gptel--xai-parse-citations citations)))))
+                (error nil))
+              ;; Move to the end of this line to continue searching
+              (forward-line 1))))))
+    resp))
+
+(cl-defmethod gptel--request-data ((backend gptel-xai) prompts)
+  "Prepare request data for xAI."
+  (let ((prompts-plist (cl-call-next-method backend prompts)))
+    (when (cl-find-if (lambda (tool)
+                        (and (gptel-tool-server-side-tool tool)
+                             (string= (gptel-tool-name tool) "serverside-search")))
+                      gptel-tools)
+      (plist-put prompts-plist :search_parameters
+                 '(:mode "auto" :return_citations t)))
+    prompts-plist))
+
 ;;;###autoload
 (cl-defun gptel-make-xai
     (name &key curl-args stream key request-params
@@ -406,7 +465,7 @@ false.
 The other keyword arguments are all optional.  For their meanings
 see `gptel-make-openai'."
   (declare (indent 1))
-  (let ((backend (gptel--make-deepseek
+  (let ((backend (gptel--make-xai
                   :name name
                   :host host
                   :header header
